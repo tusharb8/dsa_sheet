@@ -102,16 +102,14 @@ export class ChatService {
       `You are "DSA Buddy", a helpful assistant for the DSA Sheet app.`,
       `Today is ${new Date().toISOString().slice(0, 10)}.`,
       `The logged-in user is ${user.name} (${user.email}) with roles: ${user.roles.map((r) => r.name).join(', ') || 'none'}.`,
-      `Use the provided tools to answer questions about topics, problems, resources, and the user's progress.`,
+      `You have tools that can look up real data from the app. Use them whenever the user asks about topics, problems, resources, progress, or anything that depends on app data.`,
       `When the user asks to mark a problem as solved, use mark_problem_solved.`,
-      `If a tool call fails or returns an error, explain it to the user. Be concise and friendly.`,
       ``,
-      `STRICT RULES — follow these in every answer:`,
-      `1. Answer ONLY using information returned by the tools. Never rely on your own memory or general knowledge.`,
-      `2. If a tool returns a list of items, reproduce that list EXACTLY — same items, same count, same order. Never add, remove, merge, rename, or reorder items.`,
-      `3. Never invent problems, topics, names, counts, or any data that is not present in the tool output.`,
-      `4. If the tool output does not contain the answer to the user's question, say so directly instead of guessing.`,
-      `5. When reporting counts (e.g. number of problems), use the count returned by the tool, never a computed or remembered one.`,
+      `Guidelines:`,
+      `- Base your answers on the tool results so they reflect the actual data.`,
+      `- If the tools find no match (e.g. a topic lookup returns "not found"), tell the user what you found and suggest get_topics or search_problem rather than guessing.`,
+      `- When listing topics, problems, or counts, prefer the data from the tools over memory.`,
+      `- Be concise and friendly.`,
     ].join('\n');
   }
 
@@ -171,12 +169,46 @@ export class ChatService {
       { topicId: { type: 'number' }, name: { type: 'string' } },
       [],
       async ({ topicId, name }: { topicId?: number; name?: string }) => {
-        const topic = name
-          ? await this.topics.findOne({ where: { name }, relations: ['problems', 'resources'] })
-          : topicId
-            ? await this.topics.findOne({ where: { id: topicId }, relations: ['problems', 'resources'] })
-            : null;
-        if (!topic) return { error: `Topic not found. Use get_topics to list available topics.` };
+        let topic: Topic | null = null;
+        if (name) {
+          topic = await this.topics.findOne({ where: { name }, relations: ['problems', 'resources'] });
+          if (!topic) {
+            topic = await this.topics.findOne({
+              where: { name: ILike(name) },
+              relations: ['problems', 'resources'],
+            });
+          }
+          if (!topic && name.length > 1 && name.toLowerCase().endsWith('s')) {
+            topic = await this.topics.findOne({
+              where: { name: ILike(name.slice(0, -1)) },
+              relations: ['problems', 'resources'],
+            });
+          }
+          if (!topic) {
+            topic = await this.topics.findOne({
+              where: { name: ILike(`${name}s`) },
+              relations: ['problems', 'resources'],
+            });
+          }
+          if (!topic) {
+            const matches = await this.topics.find({
+              where: { name: ILike(`%${name}%`) },
+              select: ['id', 'name'],
+            });
+            if (matches.length === 0) {
+              return { error: `Topic "${name}" not found. Use get_topics to list available topics.` };
+            }
+            return {
+              error: `Topic "${name}" not found. Did you mean one of: ${matches.map((m) => m.name).join(', ')}?`,
+              suggestions: matches.map((m) => m.name),
+            };
+          }
+        } else if (topicId) {
+          topic = await this.topics.findOne({ where: { id: topicId }, relations: ['problems', 'resources'] });
+          if (!topic) return { error: `Topic ${topicId} not found. Use get_topics to list available topics.` };
+        } else {
+          return { error: 'Provide a topic id or name.' };
+        }
         return {
           id: topic.id,
           name: topic.name,
