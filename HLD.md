@@ -17,12 +17,14 @@ graph TB
     Auth["Authentication<br/>(JWT + Bcrypt)"]
     DB["PostgreSQL Database"]
     Email["Email Service"]
+    Ollama["Ollama LLM<br/>(llama3.1:8b, local)"]
     Storage["File Upload<br/>Service"]
     
     Client -->|HTTP/REST| Server
     Server -->|Validate Token| Auth
     Server -->|SQL Queries| DB
     Server -->|Send Emails| Email
+    Server -->|Tool calls / Chat| Ollama
     Server -->|Process in-memory| Storage["File Upload<br/>(not implemented<br/>— stored in-memory)"]
     
     Auth -->|User Credentials| DB
@@ -149,6 +151,54 @@ sequenceDiagram
     Client->>Client: Render stats + streak badge
 ```
 
+### 4.4 Chatbot & Tool-Calling Flow
+
+The chatbot ("DSA Buddy") runs the local **Ollama** model (default `llama3.1:8b`) with a manual tool-calling loop. The model can invoke DSA Sheet APIs (topics, problems, progress, mark-solved) as tools, and the loop repeats until the model produces a final text answer (max 8 iterations).
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Client as React ChatWidget
+    participant Server as API Server
+    participant Svc as ChatService
+    participant Ollama as Ollama LLM<br/>(llama3.1:8b)
+    participant DB as Database
+
+    User->>Client: Type a message
+    Client->>Server: POST /chat {message, history}
+    Server->>Svc: chat(user, message, history)
+    Svc->>Svc: Build tools for user (role-aware)
+    Svc->>Ollama: model.bindTools(tools).invoke(messages)
+    Ollama-->>Svc: AIMessage (text OR tool_calls)
+    alt Tool call requested
+        Svc->>Svc: Execute tool (e.g. get_topic, get_my_progress)
+        Svc->>DB: Query repository
+        DB-->>Svc: Tool result (JSON)
+        Svc->>Ollama: Append ToolMessage, invoke again
+        Ollama-->>Svc: Final AIMessage (text)
+    else Direct answer
+        Svc-->>Server: {reply}
+    end
+    Server-->>Client: {reply}
+    Client->>User: Render assistant message
+```
+
+**Tool registry** (bound per authenticated user; admin tools only added for ADMIN role):
+
+| Tool | Purpose |
+|------|---------|
+| `get_topics` | List topics with problem/resource counts |
+| `get_topic` | Resources + problems for a topic (by id **or** exact name) |
+| `search_problem` | Search problems by title/URL keyword |
+| `get_my_progress` | Logged-in user's solved count + list |
+| `get_my_daily_stats` | Daily solved counts + streak |
+| `get_next_unsolved` | Next unsolved problem |
+| `mark_problem_solved` | Mark a problem solved for the user |
+| `get_users` *(ADMIN)* | List all users |
+| `get_student_progress` *(ADMIN)* | Any student's progress report |
+
+**Prompt design:** a system prompt instructs the model to answer *only* from tool output, reproduce lists exactly, and never invent data — mitigating hallucination (e.g. the model once listed 10 well-known Graph problems when only 5 existed).
+
 ---
 
 ## 5. Core Modules & Services
@@ -167,6 +217,7 @@ sequenceDiagram
 | **Rights Module** | Fine-grained permissions | RightsService (manage permission rights) |
 | **Upload Module** | File upload (Excel parsing) | UploadService (parse .xlsx, create/upsert topics/problems/resources in-memory) |
 | **Email Module** | Email notifications | EmailService (account creation & password change emails) |
+| **Chat Module** | AI assistant with tool calling | ChatService (Ollama via @langchain/ollama, DSA tools, manual agent loop) |
 
 ---
 
@@ -239,6 +290,15 @@ DELETE /rights/:id                 - Delete right (ADMIN)
 POST   /upload                     - Upload Excel file (ADMIN)
 ```
 
+### 6.6 Chat & AI Assistant
+
+```
+GET    /chat/status                - Check Ollama availability & model
+POST   /chat                       - Send message; model may call DSA tools (JWT)
+```
+
+`POST /chat` body: `{ "message": string, "history": [{ "role": "user"|"assistant", "content": string }] }` → `{ "reply": string }`. History is client-managed (last ~8 messages) and sent on each request; the server is stateless.
+
 ---
 
 ## 7. Client-Side Architecture (React)
@@ -256,6 +316,7 @@ graph TB
     Progress["Progress Page<br/>(Statistics)"]
     Topic["TopicDetail Page<br/>(Topic with Problems)"]
     Admin["Admin Page<br/>(User Management)"]
+    ChatWidget["ChatWidget<br/>(Floating AI Assistant)"]
     
     Store["Redux Store"]
     API["API Layer<br/>(request/uploadFile)"]
@@ -267,6 +328,7 @@ graph TB
     Routes --> Progress
     Routes --> Topic
     Routes --> Admin
+    Layout --> ChatWidget
     
     Auth --> Store
     Sheet --> Store
@@ -275,6 +337,7 @@ graph TB
     Admin --> Store
     
     Store --> API
+    ChatWidget --> API
     API -->|Fetch| Server["API Server"]
 ```
 
@@ -286,6 +349,8 @@ graph TB
 - **progressSlice** - Problem-solving progress
 - **rolesSlice** - User roles & permissions
 - **rightsSlice** - Permission management
+
+> **ChatWidget** keeps conversation state in component-local React state (not Redux) and calls `/chat` directly through the API layer.
 
 ---
 
@@ -437,6 +502,7 @@ graph TB
         Storage["Object Storage<br/>(not implemented<br/>— in-memory only)"]
     end
     
+    Ollama["Ollama<br/>(llama3.1:8b)<br/>local / dedicated host"]
     Users["Users"]
     
     Users -->|HTTPS| Client
@@ -456,6 +522,10 @@ graph TB
     Server1 -->|Store| Storage
     Server2 -->|Store| Storage
     Server3 -->|Store| Storage
+    
+    Server1 -->|Chat / tool calls| Ollama
+    Server2 -->|Chat / tool calls| Ollama
+    Server3 -->|Chat / tool calls| Ollama
 ```
 
 ---
@@ -504,6 +574,7 @@ The **Apna College DSA Sheet** is a modern, scalable learning platform built wit
 - **JWT-based stateless authentication** for horizontal scaling
 - **Role & rights-based access control** for flexible permissions
 - **Progress tracking with streak calculation** for user engagement
+- **Local LLM chatbot** with role-aware tool calling for natural-language access to topics, problems, and progress
 - **RESTful API** with comprehensive Swagger documentation
 - **React frontend** with Redux state management
 - **PostgreSQL database** with proper indexing for 10k-50k users
@@ -527,3 +598,7 @@ The following features are valuable enhancements that can be added to improve sc
 9. **Persist Solved Problems** — Save solved problem state to Redux/database to persist across page reloads (currently lost on refresh)
 10. **CORS Origin Restrictions** — Configure specific allowed origins instead of fully open CORS
 11. **Wired Delete User Button** — Connect the existing `deleteUser` Redux action to the Admin UI (currently imported but unused)
+12. **Streaming Chat Replies** — Stream tokens from Ollama (Server-Sent Events) so the chat widget shows answers incrementally instead of waiting for the full reply
+13. **Persist Chat History** — Store conversations server-side (e.g. a `chat_message` table) so users can resume chats across sessions
+14. **Chat Tool-Call Logging** — Record tool calls + results for auditing and to debug/fix model behavior (basic logging exists via `[chat] tool call`)
+15. **LLM Model Upgrades** — Swap `llama3.1:8b` for a stronger model (e.g. GPT-4o-class via an API) or larger local model for better multi-step tool-calling reliability

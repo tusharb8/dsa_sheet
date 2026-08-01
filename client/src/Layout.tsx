@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom';
 import { useSelector, useDispatch } from 'react-redux';
 import { logout } from './store/authSlice';
 import { fetchTopics } from './store/topicsSlice';
+import ChatWidget from './components/ChatWidget';
 import type { RootState, AppDispatch } from './store';
 
 function useTheme() {
@@ -75,6 +76,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       <main className="main-content">
         {children}
       </main>
+
+      <ChatWidget />
     </div>
   );
 }

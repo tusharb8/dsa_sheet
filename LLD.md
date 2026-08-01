@@ -633,6 +633,64 @@ classDiagram
 
 ---
 
+#### 4.1.7 ChatService
+
+```mermaid
+classDiagram
+    class ChatService {
+        -ChatOllama model
+        -TopicRepository topics
+        -ResourceRepository resources
+        -ProblemRepository problems
+        -ProgressRepository progress
+        -UserRepository users
+        +status() StatusResponse
+        +chat(user, message, history) ChatResponse
+        -invoke(messages, bindTools) AIMessage
+        -systemPrompt(user) string
+        -contentToString(content) string
+        -execute(executors, name, args) string
+        -buildTools(user) ToolSet
+        -calcStreak(dates) int
+    }
+
+    class ChatResponse {
+        +string reply
+    }
+
+    class ToolSet {
+        +any[] bindTools
+        +Record~string, ToolFn~ executors
+    }
+
+    ChatService --> ChatResponse
+    ChatService --> ToolSet
+```
+
+**Methods:**
+- `status()`: Check Ollama reachability (`/api/tags`) and return availability + model
+- `chat()`: Bind role-aware tools, run the manual agent loop (max 8 iterations), return the final text reply
+- `buildTools()`: Register DSA tools via `@langchain/core` `tool()`; admin-only tools are added when the user has the ADMIN role
+- `execute()`: Run a requested tool and stringify its result as a `ToolMessage` for the model
+- `systemPrompt()`: Instructs the model to answer only from tool output and reproduce lists exactly (hallucination mitigation)
+- `calcStreak()`: Consecutive-day streak ending today (shared logic with ProgressService)
+
+**Tool registry** (`buildTools`):
+
+| Tool | Name | Schema | Notes |
+|------|------|--------|-------|
+| List topics | `get_topics` | `{}` | id, name, problem/resource counts |
+| Topic detail | `get_topic` | `topicId?`, `name?` | Prefers `name` when both provided |
+| Search problems | `search_problem` | `query` | ILIKE on title/url, max 10 |
+| Own progress | `get_my_progress` | `{}` | solved/total + list |
+| Daily stats | `get_my_daily_stats` | `{}` | daily counts + streak |
+| Next unsolved | `get_next_unsolved` | `{}` | first unsolved problem |
+| Mark solved | `mark_problem_solved` | `problemId` | duplicate-safe |
+| List users | `get_users` | `{}` | ADMIN only |
+| Student progress | `get_student_progress` | `userId` | ADMIN only |
+
+---
+
 ## 5. Controller Layer Architecture
 
 ### 5.1 Endpoint Details
@@ -742,6 +800,34 @@ classDiagram
 
 ---
 
+#### 5.1.5 Chat Controller
+
+```mermaid
+classDiagram
+    class ChatController {
+        -ChatService service
+        +status() StatusResponse
+        +chat(req, body) ChatResponse
+    }
+
+    class ChatDto {
+        +string message
+        +ChatHistoryItem[] history
+    }
+
+    ChatController --> ChatService
+    ChatController --> ChatDto
+```
+
+| Method | Endpoint | Auth | Params | Returns |
+|--------|----------|------|--------|---------|
+| GET | `/chat/status` | JWT | — | StatusResponse |
+| POST | `/chat` | JWT | message, history | ChatResponse |
+
+`POST /chat` is validated with class-validator (`ChatDto`): `message` is required (non-empty string); `history` is an optional array of `{ role: 'user' | 'assistant', content: string }`. The service runs on behalf of `req.user`, so tools are scoped to the authenticated user and admin-only tools are exposed only to admins.
+
+---
+
 ## 6. Guard & Decorator Implementation
 
 ### 6.1 Authentication Guard (JWT)
@@ -845,6 +931,7 @@ graph TB
     RightsModule["RightsModule<br/>- RightsController<br/>- RightsService"]
     EmailModule["EmailModule<br/>- EmailService"]
     UploadModule["UploadModule<br/>- UploadService"]
+    ChatModule["ChatModule<br/>- ChatController<br/>- ChatService"]
     
     DB[(TypeORM<br/>PostgreSQL)]
     
@@ -857,6 +944,7 @@ graph TB
     AppModule -->|imports| RoleModule
     AppModule -->|imports| RightsModule
     AppModule -->|imports| UploadModule
+    AppModule -->|imports| ChatModule
     
     AuthModule -->|uses| DB
     UserModule -->|uses| DB
@@ -866,11 +954,14 @@ graph TB
     ResourceModule -->|uses| DB
     RoleModule -->|uses| DB
     RightsModule -->|uses| DB
+    ChatModule -->|uses| DB
     
     AuthModule -->|imports| EmailModule
     UserModule -->|imports| EmailModule
     EmailModule -->|uses| DB
 ```
+
+**ChatModule imports:** `TypeOrmModule.forFeature([Topic, Resource, Problem, Progress, User])` — it queries the DB directly for tool results (repositories, not the HTTP layer), so no cross-module imports are required.
 
 ---
 
@@ -1085,6 +1176,25 @@ interface DailyStats {
 }
 ```
 
+### 13.4 Chat Response
+
+```typescript
+interface ChatRequest {
+  message: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+}
+
+interface ChatResponse {
+  reply: string;  // final text answer from the LLM after tool calls resolve
+}
+
+interface StatusResponse {
+  ok: boolean;
+  model: string;         // e.g. "llama3.1:8b"
+  available?: string[];  // models present on the Ollama host (when reachable)
+}
+```
+
 ---
 
 ## 14. Summary
@@ -1122,3 +1232,7 @@ The following enhancements can strengthen the database design, API security, and
 10. **Pagination on Frontend** — Persist solved-problem state to database instead of losing it on page reload (currently only in local React state)
 11. **Secure Password Reset** — Implement time-limited reset tokens instead of auto-generating passwords
 12. **CORS Origin Whitelist** — Replace fully open CORS with a whitelist of allowed origins
+13. **Streaming Chat Replies** — Stream Ollama tokens to the client (SSE) so the chat widget renders incrementally; current `POST /chat` returns the full reply at once
+14. **Persist Chat History** — Add a `chat_message` table (id, user_id, role, content, created_at) to support resumable conversations
+15. **Tool-Call Audit Table** — Log each tool name, args, result, and latency for debugging/hallucination analysis
+16. **Ollama Keep-Alive Tuning** — Set `OLLAMA_KEEP_ALIVE` so the model stays loaded between requests and avoids ~13s reload latency on CPU-only inference
