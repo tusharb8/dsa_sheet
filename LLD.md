@@ -1,4 +1,4 @@
-# Apna College - Low-Level Design (LLD)
+# DSA Learning Tool - Low-Level Design (LLD)
 
 ## 1. Database Schema Design
 

@@ -1,8 +1,8 @@
-# Apna College - High-Level Design (HLD)
+# DSA Learning Tool - High-Level Design (HLD)
 
 ## 1. System Overview
 
-Apna College is a **Data Structures and Algorithms (DSA) Learning Platform** designed for users to track and improve their problem-solving skills. The system enables students to solve coding problems, track their progress, and access learning resources organized by topics.
+The DSA Learning Tool is a **Data Structures and Algorithms (DSA) Learning Platform** designed for users to track and improve their problem-solving skills. The system enables students to solve coding problems, track their progress, and access learning resources organized by topics.
 
 **Target Users:** 10k-50k active users (students, instructors, admins)
 
@@ -570,7 +570,7 @@ graph TB
 
 ## 15. Summary
 
-The **Apna College DSA Sheet** is a modern, scalable learning platform built with:
+The **DSA Learning Tool** is a modern, scalable learning platform built with:
 - **JWT-based stateless authentication** for horizontal scaling
 - **Role & rights-based access control** for flexible permissions
 - **Progress tracking with streak calculation** for user engagement
