@@ -80,6 +80,15 @@ export class ChatService {
         continue;
       }
 
+      const embedded = this.extractEmbeddedToolCalls(response.content);
+      if (embedded.length) {
+        for (const call of embedded) {
+          const result = await this.execute(executors, call.name, call.args);
+          msgs = [...msgs, new ToolMessage(result, `call_${call.name}`)];
+        }
+        continue;
+      }
+
       return { reply: this.contentToString(response.content) };
     }
 
@@ -106,6 +115,7 @@ export class ChatService {
       `When the user asks to mark a problem as solved, use mark_problem_solved.`,
       ``,
       `Guidelines:`,
+      `- Call the tools directly whenever you need data. NEVER print a tool call as JSON in your reply text — just make the call.`,
       `- Base your answers on the tool results so they reflect the actual data.`,
       `- If the tools find no match (e.g. a topic lookup returns "not found"), tell the user what you found and suggest get_topics or search_problem rather than guessing.`,
       `- When listing topics, problems, or counts, prefer the data from the tools over memory.`,
@@ -119,6 +129,23 @@ export class ChatService {
       return content.map((c: any) => c.text ?? JSON.stringify(c)).join('');
     }
     return JSON.stringify(content);
+  }
+
+  private extractEmbeddedToolCalls(content: unknown): { name: string; args: Record<string, any> }[] {
+    const text = this.contentToString(content);
+    const calls: { name: string; args: Record<string, any> }[] = [];
+    const regex = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\}\s*)\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(text)) !== null) {
+      let args: Record<string, any> = {};
+      try {
+        args = JSON.parse(m[2]);
+      } catch {
+        args = {};
+      }
+      calls.push({ name: m[1], args });
+    }
+    return calls;
   }
 
   private async execute(executors: Record<string, ToolFn>, name: string, args: any): Promise<string> {
