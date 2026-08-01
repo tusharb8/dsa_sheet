@@ -116,6 +116,8 @@ export class ChatService {
       ``,
       `Guidelines:`,
       `- Call the tools directly whenever you need data. NEVER print a tool call as JSON in your reply text — just make the call.`,
+      `- Topic questions: if the user asks about a topic by name (e.g. "linked list", "graphs", "arrays"), or how many problems a topic has, or the problems/resources of a topic, call get_topic with the topic name. It returns ALL problems and resources for that topic.`,
+      `- Keyword search: use search_problem ONLY when the user wants to find problems by a keyword that is NOT about a whole topic.`,
       `- Base your answers on the tool results so they reflect the actual data.`,
       `- If the tools find no match (e.g. a topic lookup returns "not found"), tell the user what you found and suggest get_topics or search_problem rather than guessing.`,
       `- When listing topics, problems, or counts, prefer the data from the tools over memory.`,
@@ -192,7 +194,7 @@ export class ChatService {
 
     register(
       'get_topic',
-      'Get resources and problems for a specific topic. Provide either its id or its exact name.',
+      'Get ALL resources and problems for a specific topic. Use this for topic questions such as "tell me about linked list", "how many problems in arrays", or "list problems in graphs". Provide either its id or its exact name.',
       { topicId: { type: 'number' }, name: { type: 'string' } },
       [],
       async ({ topicId, name }: { topicId?: number; name?: string }) => {
@@ -247,7 +249,7 @@ export class ChatService {
 
     register(
       'search_problem',
-      'Search problems by title or URL keyword.',
+      'Search problems by a keyword in the title or URL. Use ONLY when the user is not asking about a whole topic.',
       { query: { type: 'string' } },
       ['query'],
       async ({ query }: { query: string }) => {
