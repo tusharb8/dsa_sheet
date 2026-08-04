@@ -7,9 +7,10 @@ import { Resource } from '../resource/entities/resource.entity';
 import { Problem } from '../problem/entities/problem.entity';
 import { Progress } from '../progress/entities/progress.entity';
 import { User } from '../user/entities/user.entity';
+import { VectorModule } from '../vector/vector.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Topic, Resource, Problem, Progress, User])],
+  imports: [TypeOrmModule.forFeature([Topic, Resource, Problem, Progress, User]), VectorModule],
   controllers: [ChatController],
   providers: [ChatService],
 })

@@ -12,6 +12,7 @@ import { RoleModule } from './role/role.module';
 import { RightsModule } from './rights/rights.module';
 import { ProgressModule } from './progress/progress.module';
 import { ChatModule } from './chat/chat.module';
+import { VectorModule } from './vector/vector.module';
 import { SeedService } from './seed.service';
 import { Role } from './role/entities/role.entity';
 import { Right } from './rights/entities/right.entity';
@@ -41,6 +42,7 @@ import { User } from './user/entities/user.entity';
     RightsModule,
     ProgressModule,
     ChatModule,
+    VectorModule,
   ],
   providers: [SeedService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

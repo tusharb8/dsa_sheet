@@ -41,6 +41,8 @@ A Data Structures and Algorithms (DSA) learning platform for tracking and improv
 | `@langchain/core` | ^1.2.4 | LangChain tool definitions and message types |
 | `@langchain/ollama` | ^1.3.0 | Ollama LLM integration for the chatbot |
 | `@langchain/community` | ^1.1.29 | Community models/callbacks used with the chat loop |
+| `@qdrant/js-client-rest` | ^1.x | Qdrant REST client for semantic search |
+| `dotenv` | ^16.x | Loads `server/.env` variables at startup |
 | `ts-node` | ^10.9.2 | TypeScript execution for `start:dev` |
 
 Dev dependencies: `@types/bcrypt`, `@types/multer`, `@types/node`, `@types/passport-jwt`, `tsx`, `typescript`.
@@ -82,6 +84,7 @@ Dev dependencies:
 | PostgreSQL | 14+ running on `localhost:5432` (port/password configurable in `.env`) |
 | npm | 10+ |
 | Ollama | *Optional* — only needed for the chatbot. Install from [ollama.com](https://ollama.com) |
+| Qdrant | *Optional* — vector DB for semantic search (self-hosted via Docker, or use [Qdrant Cloud](https://cloud.qdrant.io)) |
 
 ### 1. Clone & install
 
@@ -128,6 +131,23 @@ ollama pull llama3.1:8b
 # ensure the Ollama service is running (default: http://localhost:11434)
 ```
 
+For semantic search, also pull the embedding model:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+### 3b. (Optional) Configure Qdrant
+
+Self-host with Docker (`docker compose up -d qdrant`), or use a Qdrant Cloud cluster. Then set in `server/.env`:
+
+```env
+QDRANT_URL=https://your-cluster-id.eu-central-1-0.aws.cloud.qdrant.io
+QDRANT_API_KEY=your_api_key
+```
+
+The collection is created automatically on first use. Re-index existing data by calling `POST /vector/reindex` (authenticated) — uploads via the Excel import re-index automatically.
+
 ### 4. Run the server
 
 ```bash
@@ -161,3 +181,13 @@ Log in as the admin, then upload `client/public/sample-dsa-sheet.xlsx` via the A
 ## Chatbot
 
 The chatbot uses the local [Ollama](https://ollama.com) model (`llama3.1:8b`) via LangChain. Configure it with `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in `server/.env`. The model can call DSA Sheet APIs as tools (topics, problems, progress, mark-solved) and answers strictly from tool results.
+
+## Semantic search (Qdrant)
+
+Problems and resources are embedded (`EMBEDDING_MODEL`, default `nomic-embed-text`) and stored in Qdrant. This powers meaning-based lookups:
+
+- Chatbot tool `search_semantic` — e.g. "problems about two pointers" or "videos on recursion".
+- `search_problem` tries Qdrant first and falls back to SQL `LIKE` when the vector store is unreachable.
+- Admin/Dev endpoints: `GET /vector/status`, `POST /vector/reindex`, `GET /vector/search?q=...`.
+
+Sync is automatic: Excel uploads re-index everything, and problem/resource create/update/delete keep the collection in sync.

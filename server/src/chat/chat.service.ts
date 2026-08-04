@@ -16,6 +16,7 @@ import { Problem } from '../problem/entities/problem.entity';
 import { Progress } from '../progress/entities/progress.entity';
 import { User } from '../user/entities/user.entity';
 import { ChatHistoryItem } from './dto/chat.dto';
+import { VectorService } from '../vector/vector.service';
 
 const BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 const MODEL = process.env.OLLAMA_MODEL || 'llama3.1:8b';
@@ -38,6 +39,7 @@ export class ChatService {
     @InjectRepository(Problem) private readonly problems: Repository<Problem>,
     @InjectRepository(Progress) private readonly progress: Repository<Progress>,
     @InjectRepository(User) private readonly users: Repository<User>,
+    private readonly vector: VectorService,
   ) {
     this.model = new ChatOllama({
       baseUrl: BASE_URL,
@@ -118,6 +120,7 @@ export class ChatService {
       `- Call the tools directly whenever you need data. NEVER print a tool call as JSON in your reply text — just make the call.`,
       `- Topic questions: if the user asks about a topic by name (e.g. "linked list", "graphs", "arrays"), or how many problems a topic has, or the problems/resources of a topic, call get_topic with the topic name. It returns ALL problems and resources for that topic.`,
       `- Keyword search: use search_problem ONLY when the user wants to find problems by a keyword that is NOT about a whole topic.`,
+      `- Meaning search: use search_semantic when the user describes what they want in words (e.g. "two pointers", "shortest path", "videos on recursion") rather than a whole topic name. It returns problems AND resources ranked by relevance.`,
       `- Base your answers on the tool results so they reflect the actual data.`,
       `- If the tools find no match (e.g. a topic lookup returns "not found"), tell the user what you found and suggest get_topics or search_problem rather than guessing.`,
       `- When listing topics, problems, or counts, prefer the data from the tools over memory.`,
@@ -249,16 +252,59 @@ export class ChatService {
 
     register(
       'search_problem',
-      'Search problems by a keyword in the title or URL. Use ONLY when the user is not asking about a whole topic.',
+      'Search problems by a keyword in the title or URL, or by meaning (semantic search). Use ONLY when the user is not asking about a whole topic.',
       { query: { type: 'string' } },
       ['query'],
       async ({ query }: { query: string }) => {
+        if (this.vector.enabled) {
+          try {
+            const hits = await this.vector.search(query, 10, 'problem');
+            if (hits.length > 0) {
+              return hits.map((h) => ({
+                id: h.id,
+                title: h.title,
+                url: h.url,
+                difficulty: h.difficulty ?? null,
+                topic: h.topic ?? null,
+                score: Number(h.score.toFixed(3)),
+              }));
+            }
+          } catch (e: any) {
+            console.warn('[chat] semantic search failed, falling back to SQL:', e.message);
+          }
+        }
         const problems = await this.problems.find({
           where: [{ title: ILike(`%${query}%`) }, { url: ILike(`%${query}%`) }],
           take: 10,
         });
         if (problems.length === 0) return { error: `No problems found matching "${query}"` };
         return problems.map((p) => ({ id: p.id, title: p.title, url: p.url, difficulty: p.difficulty }));
+      },
+    );
+
+    register(
+      'search_semantic',
+      'Search problems and learning resources by MEANING, not exact keywords. Use for fuzzy questions such as "problems about two pointers", "which topic covers shortest paths", or "videos on recursion". Returns the closest matches with a relevance score. Use ONLY when the user is not asking about a whole topic by name.',
+      { query: { type: 'string' }, limit: { type: 'number' } },
+      ['query'],
+      async ({ query, limit }: { query: string; limit?: number }) => {
+        if (!this.vector.enabled) {
+          return { error: 'Semantic search is unavailable (vector store not configured). Try search_problem instead.' };
+        }
+        try {
+          const hits = await this.vector.search(query, limit ?? 8);
+          return hits.map((h) => ({
+            id: h.id,
+            type: h.type,
+            title: h.title,
+            url: h.url,
+            topic: h.topic ?? null,
+            difficulty: h.difficulty ?? null,
+            score: Number(h.score.toFixed(3)),
+          }));
+        } catch (e: any) {
+          return { error: `Semantic search failed: ${e.message}` };
+        }
       },
     );
 

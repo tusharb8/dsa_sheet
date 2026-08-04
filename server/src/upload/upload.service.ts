@@ -5,6 +5,7 @@ import * as XLSX from 'xlsx';
 import { Topic } from '../topic/entities/topic.entity';
 import { Resource, ResourceType } from '../resource/entities/resource.entity';
 import { Problem, Difficulty } from '../problem/entities/problem.entity';
+import { VectorService } from '../vector/vector.service';
 
 @Injectable()
 export class UploadService {
@@ -12,6 +13,7 @@ export class UploadService {
     @InjectRepository(Topic) private topics: Repository<Topic>,
     @InjectRepository(Resource) private resources: Repository<Resource>,
     @InjectRepository(Problem) private problems: Repository<Problem>,
+    private readonly vector: VectorService,
   ) {}
 
   async process(file: Express.Multer.File) {
@@ -58,6 +60,8 @@ export class UploadService {
         }
       }
     }
+
+    await this.vector.reindexAll().catch((e) => console.warn('[upload] vector reindex failed:', e.message));
 
     return { ok: true, topics: seen.size };
   }
