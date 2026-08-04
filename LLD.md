@@ -639,6 +639,7 @@ classDiagram
 classDiagram
     class ChatService {
         -ChatOllama model
+        -VectorService vector
         -TopicRepository topics
         -ResourceRepository resources
         -ProblemRepository problems
@@ -665,6 +666,7 @@ classDiagram
 
     ChatService --> ChatResponse
     ChatService --> ToolSet
+    ChatService --> VectorService
 ```
 
 **Methods:**
@@ -681,13 +683,84 @@ classDiagram
 |------|------|--------|-------|
 | List topics | `get_topics` | `{}` | id, name, problem/resource counts |
 | Topic detail | `get_topic` | `topicId?`, `name?` | Prefers `name` when both provided |
-| Search problems | `search_problem` | `query` | ILIKE on title/url, max 10 |
+| Search problems | `search_problem` | `query` | Qdrant semantic first (`type=problem`), `ILIKE` on title/url fallback, max 10 |
+| Semantic search | `search_semantic` | `query`, `limit?` | Qdrant search over problems **and** resources, ranked |
 | Own progress | `get_my_progress` | `{}` | solved/total + list |
 | Daily stats | `get_my_daily_stats` | `{}` | daily counts + streak |
 | Next unsolved | `get_next_unsolved` | `{}` | first unsolved problem |
 | Mark solved | `mark_problem_solved` | `problemId` | duplicate-safe |
 | List users | `get_users` | `{}` | ADMIN only |
 | Student progress | `get_student_progress` | `userId` | ADMIN only |
+
+---
+
+#### 4.1.8 VectorService
+
+Semantic search over problems and resources. Embeds text with Ollama `nomic-embed-text` (768-dim, cosine distance) and stores/query points in the Qdrant collection `dsa_sheet`.
+
+```mermaid
+classDiagram
+    class VectorService {
+        -QdrantClient client
+        -OllamaEmbeddings embeddings
+        -TopicRepository topics
+        -ResourceRepository resources
+        -ProblemRepository problems
+        +onModuleInit() void
+        +status() StatusResponse
+        +ensureCollection() void
+        +embed(text) number[]
+        +loadDocs() IndexedDoc[]
+        +upsertDocs(docs) void
+        +reindexAll() ReindexResult
+        +search(query, limit, type) Hit[]
+        +removeByType(type, id) void
+        -pointId(type, id) number
+    }
+
+    class IndexedDoc {
+        +string id
+        +string type "problem | resource"
+        +string title
+        +string url
+        +string topicName
+        +string difficulty?
+        +string text "indexed/embedded content"
+    }
+
+    class Hit {
+        +number id "entity id"
+        +number pointId "Qdrant point id"
+        +number score "cosine similarity"
+        +string type
+        +string title
+        +string url
+        +string topic
+        +string difficulty
+    }
+
+    VectorService --> IndexedDoc
+    VectorService --> Hit
+```
+
+**Vector collection design (`dsa_sheet`):**
+
+| Property | Value |
+|----------|-------|
+| Vector size | 768 (`EMBEDDING_DIM`) |
+| Distance | Cosine |
+| Point ID scheme | `problem-{id}` → `{id}`; `resource-{id}` → `{1_000_000_000 + id}` |
+| Payload | `{ type, id, title, url, topic, difficulty, text }` |
+
+**Methods:**
+- `ensureCollection()`: Create the collection if it does not exist (idempotent; called on startup and before every search)
+- `embed()`: One-shot 768-dim embedding via `OllamaEmbeddings`
+- `loadDocs()`: Load all topics/problems/resources from TypeORM and build indexed documents (`"{title} ({topic}) difficulty {difficulty}"`)
+- `reindexAll()`: Embed + upsert every document, then delete points that no longer exist in the DB (stale cleanup)
+- `search()`: Embed the query, run Qdrant similarity search (optional `type` payload filter), return hits with scores
+- `removeByType()`: Delete a single point (called on problem/resource delete)
+
+**Config (env):** `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` (default `dsa_sheet`), `EMBEDDING_MODEL` (default `nomic-embed-text`), `EMBEDDING_DIM` (default 768). Auto-sync hooks: `UploadService.process()` calls `reindexAll()`; `ProblemService`/`ResourceService` call `upsertDocs()`/`removeByType()` on create/update/delete.
 
 ---
 
@@ -828,6 +901,28 @@ classDiagram
 
 ---
 
+#### 5.1.6 Vector Controller
+
+```mermaid
+classDiagram
+    class VectorController {
+        -VectorService service
+        +status() StatusResponse
+        +reindex() ReindexResult
+        +search(q, limit, type) Hit[]
+    }
+
+    VectorController --> VectorService
+```
+
+| Method | Endpoint | Auth | Params | Returns |
+|--------|----------|------|--------|---------|
+| GET | `/vector/status` | JWT | — | StatusResponse (ok, url, collection, points, model, dim) |
+| POST | `/vector/reindex` | JWT | — | `{ ok, indexed, removed }` |
+| GET | `/vector/search` | JWT | q (required), limit?, type? | Hit[] (ranked by score) |
+
+---
+
 ## 6. Guard & Decorator Implementation
 
 ### 6.1 Authentication Guard (JWT)
@@ -932,8 +1027,10 @@ graph TB
     EmailModule["EmailModule<br/>- EmailService"]
     UploadModule["UploadModule<br/>- UploadService"]
     ChatModule["ChatModule<br/>- ChatController<br/>- ChatService"]
+    VectorModule["VectorModule<br/>- VectorController<br/>- VectorService"]
     
     DB[(TypeORM<br/>PostgreSQL)]
+    VDB[(Qdrant<br/>vector store)]
     
     AppModule -->|imports| AuthModule
     AppModule -->|imports| UserModule
@@ -945,6 +1042,7 @@ graph TB
     AppModule -->|imports| RightsModule
     AppModule -->|imports| UploadModule
     AppModule -->|imports| ChatModule
+    AppModule -->|imports| VectorModule
     
     AuthModule -->|uses| DB
     UserModule -->|uses| DB
@@ -959,9 +1057,16 @@ graph TB
     AuthModule -->|imports| EmailModule
     UserModule -->|imports| EmailModule
     EmailModule -->|uses| DB
+
+    VectorModule -->|uses| DB
+    VectorModule -->|uses| VDB
+    ChatModule -->|imports| VectorModule
+    ProblemModule -->|imports| VectorModule
+    ResourceModule -->|imports| VectorModule
+    UploadModule -->|imports| VectorModule
 ```
 
-**ChatModule imports:** `TypeOrmModule.forFeature([Topic, Resource, Problem, Progress, User])` — it queries the DB directly for tool results (repositories, not the HTTP layer), so no cross-module imports are required.
+**ChatModule imports:** `TypeOrmModule.forFeature([Topic, Resource, Problem, Progress, User])` — it queries the DB directly for tool results (repositories, not the HTTP layer). **VectorModule** (exports `VectorService`) is imported by `ChatModule`, `ProblemModule`, `ResourceModule`, and `UploadModule` so semantic sync/search works across all data-entry paths.
 
 ---
 
@@ -1114,7 +1219,17 @@ TOTAL:              ≈ 20 MB (including indexes, overhead ~30%)
 Expected DB Size:   ≈ 50-100 MB
 ```
 
-### 12.2 Query Performance Targets
+### 12.2 Vector Store Estimation
+
+Qdrant point size ≈ vector (768 floats = 3 KB) + payload overhead:
+
+```
+Problem/Resource points:  1,000 docs × ~3.2 KB ≈ 3.2 MB raw
++ HNSW index overhead (~25%):  ≈ 1 MB
+Expected collection size:  ≈ 5 MB (negligible; scales ~3.2 KB/problem/resource)
+```
+
+### 12.3 Query Performance Targets
 
 | Operation | Expected Time | Target |
 |-----------|---------------|--------|
@@ -1195,6 +1310,40 @@ interface StatusResponse {
 }
 ```
 
+### 13.5 Vector Search
+
+```typescript
+interface VectorStatus {
+  ok: boolean;
+  url: string;
+  collection: string;
+  exists: boolean;
+  shards?: number | null;
+  points: number;
+  embeddingModel: string;
+  dim: number;
+  error?: string;  // present when !ok
+}
+
+interface ReindexResult {
+  ok: boolean;
+  indexed: number;  // documents embedded + upserted
+  removed: number;  // stale points deleted
+}
+
+interface VectorHit {
+  id: number;       // entity id (problem/resource id)
+  pointId: number;  // Qdrant point id
+  score: number;    // cosine similarity (0..1)
+  type: 'problem' | 'resource';
+  title: string;
+  url: string;
+  topic: string;
+  difficulty?: string | null;
+  text: string;
+}
+```
+
 ---
 
 ## 14. Summary
@@ -1206,6 +1355,7 @@ The **LLD** defines:
 - **Cascade delete** relationships for referential integrity
 - **Enum constraints** for type safety (Difficulty, ResourceType)
 - **Composite indexes** for complex queries (daily stats, user progress)
+- **A Qdrant vector collection** (`dsa_sheet`, 768-dim cosine) for semantic search over problems and resources, synced automatically on uploads and CRUD
 - **Support for 50k users** with estimated 50-100 MB database size
 
 The design ensures:
@@ -1213,6 +1363,7 @@ The design ensures:
 - **Scalability** through proper indexing and query optimization
 - **Maintainability** through clear relationships and entity design
 - **Performance** with sub-100ms response times for core operations
+- **Semantic recall** through vector search, with SQL fallback for resilience
 
 ---
 
@@ -1236,3 +1387,6 @@ The following enhancements can strengthen the database design, API security, and
 14. **Persist Chat History** — Add a `chat_message` table (id, user_id, role, content, created_at) to support resumable conversations
 15. **Tool-Call Audit Table** — Log each tool name, args, result, and latency for debugging/hallucination analysis
 16. **Ollama Keep-Alive Tuning** — Set `OLLAMA_KEEP_ALIVE` so the model stays loaded between requests and avoids ~13s reload latency on CPU-only inference
+17. **Vector Relevance Threshold** — Discard Qdrant hits below a similarity score (e.g. 0.5) to reduce irrelevant chatbot suggestions
+18. **Hybrid Search (Vector + SQL)** — Fuse Qdrant similarity with SQL keyword matches (weighted score / Reciprocal Rank Fusion) for higher precision on exact-name queries
+19. **Embedding Model Evaluation** — Compare `nomic-embed-text` against `bge-m3`/`all-MiniLM` for retrieval quality on the DSA corpus; dimension must match `EMBEDDING_DIM`

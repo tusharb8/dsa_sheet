@@ -18,6 +18,8 @@ graph TB
     DB["PostgreSQL Database"]
     Email["Email Service"]
     Ollama["Ollama LLM<br/>(llama3.1:8b, local)"]
+    Embed["Embeddings<br/>(nomic-embed-text, local)"]
+    Qdrant["Vector Database<br/>(Qdrant Cloud)"]
     Storage["File Upload<br/>Service"]
     
     Client -->|HTTP/REST| Server
@@ -25,6 +27,8 @@ graph TB
     Server -->|SQL Queries| DB
     Server -->|Send Emails| Email
     Server -->|Tool calls / Chat| Ollama
+    Server -->|Embed text| Embed
+    Server -->|Vector search / upsert| Qdrant
     Server -->|Process in-memory| Storage["File Upload<br/>(not implemented<br/>— stored in-memory)"]
     
     Auth -->|User Credentials| DB
@@ -153,7 +157,7 @@ sequenceDiagram
 
 ### 4.4 Chatbot & Tool-Calling Flow
 
-The chatbot ("DSA Buddy") runs the local **Ollama** model (default `llama3.1:8b`) with a manual tool-calling loop. The model can invoke DSA Sheet APIs (topics, problems, progress, mark-solved) as tools, and the loop repeats until the model produces a final text answer (max 8 iterations).
+The chatbot ("DSA Buddy") runs the local **Ollama** model (default `llama3.1:8b`) with a manual tool-calling loop. The model can invoke DSA Sheet APIs (topics, problems, progress, mark-solved) as tools, and the loop repeats until the model produces a final text answer (max 8 iterations). Problem/resource lookups are **semantic**: queries are embedded and matched against the **Qdrant** vector collection, with SQL `ILIKE` as an automatic fallback.
 
 ```mermaid
 sequenceDiagram
@@ -162,6 +166,8 @@ sequenceDiagram
     participant Server as API Server
     participant Svc as ChatService
     participant Ollama as Ollama LLM<br/>(llama3.1:8b)
+    participant Embed as Embeddings<br/>(nomic-embed-text)
+    participant VDB as Qdrant<br/>(vector store)
     participant DB as Database
 
     User->>Client: Type a message
@@ -170,10 +176,15 @@ sequenceDiagram
     Svc->>Svc: Build tools for user (role-aware)
     Svc->>Ollama: model.bindTools(tools).invoke(messages)
     Ollama-->>Svc: AIMessage (text OR tool_calls)
-    alt Tool call requested
-        Svc->>Svc: Execute tool (e.g. get_topic, get_my_progress)
-        Svc->>DB: Query repository
-        DB-->>Svc: Tool result (JSON)
+    alt Tool call requested (e.g. search_problem / search_semantic)
+        Svc->>Embed: Embed query (768-dim vector)
+        Embed-->>Svc: Query vector
+        Svc->>VDB: Similarity search (top-k, type filter)
+        VDB-->>Svc: Ranked hits (payload + score)
+        alt No hits / VDB unavailable
+            Svc->>DB: Fallback SQL ILIKE query
+            DB-->>Svc: Keyword matches
+        end
         Svc->>Ollama: Append ToolMessage, invoke again
         Ollama-->>Svc: Final AIMessage (text)
     else Direct answer
@@ -189,7 +200,8 @@ sequenceDiagram
 |------|---------|
 | `get_topics` | List topics with problem/resource counts |
 | `get_topic` | Resources + problems for a topic (by id **or** exact name) |
-| `search_problem` | Search problems by title/URL keyword |
+| `search_problem` | Search problems semantically via Qdrant (SQL `ILIKE` fallback) |
+| `search_semantic` | Meaning-based search over problems **and** resources (ranked) |
 | `get_my_progress` | Logged-in user's solved count + list |
 | `get_my_daily_stats` | Daily solved counts + streak |
 | `get_next_unsolved` | Next unsolved problem |
@@ -198,6 +210,36 @@ sequenceDiagram
 | `get_student_progress` *(ADMIN)* | Any student's progress report |
 
 **Prompt design:** a system prompt instructs the model to answer *only* from tool output, reproduce lists exactly, and never invent data — mitigating hallucination (e.g. the model once listed 10 well-known Graph problems when only 5 existed).
+
+### 4.5 Vector Indexing & Sync Flow
+
+Problems and resources are embedded with Ollama `nomic-embed-text` (768-dim, cosine distance) and stored as points in the Qdrant collection `dsa_sheet`. Points use deterministic numeric IDs (`problem-{id}`, `resource-{1_000_000_000 + id}`) and carry the full search metadata as payload (`title`, `url`, `topic`, `difficulty`, `type`).
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin
+    participant Server as API Server
+    participant Svc as VectorService
+    participant Embed as Embeddings<br/>(nomic-embed-text)
+    participant VDB as Qdrant Cloud
+
+    alt Excel upload (POST /upload)
+        Admin->>Server: Upload .xlsx
+        Server->>Server: Upsert topics/problems/resources (PostgreSQL)
+        Server->>Svc: reindexAll()
+    else Admin manual (POST /vector/reindex)
+        Admin->>Server: POST /vector/reindex
+        Server->>Svc: reindexAll()
+    else CRUD (create/update/delete problem or resource)
+        Server->>Svc: upsertDocs / removeByType (single point)
+    end
+    Svc->>Embed: Embed each document text
+    Embed-->>Svc: 768-dim vectors
+    Svc->>VDB: ensureCollection + upsert points
+    Svc->>VDB: scroll + delete stale points
+    VDB-->>Svc: Indexed count
+    Svc-->>Server: { ok, indexed, removed }
+```
 
 ---
 
@@ -218,6 +260,7 @@ sequenceDiagram
 | **Upload Module** | File upload (Excel parsing) | UploadService (parse .xlsx, create/upsert topics/problems/resources in-memory) |
 | **Email Module** | Email notifications | EmailService (account creation & password change emails) |
 | **Chat Module** | AI assistant with tool calling | ChatService (Ollama via @langchain/ollama, DSA tools, manual agent loop) |
+| **Vector Module** | Semantic search index (Qdrant) | VectorService (embed, reindex, search), VectorController |
 
 ---
 
@@ -298,6 +341,16 @@ POST   /chat                       - Send message; model may call DSA tools (JWT
 ```
 
 `POST /chat` body: `{ "message": string, "history": [{ "role": "user"|"assistant", "content": string }] }` → `{ "reply": string }`. History is client-managed (last ~8 messages) and sent on each request; the server is stateless.
+
+### 6.7 Vector Search (Semantic)
+
+```
+GET    /vector/status              - Qdrant availability, collection info, point count (JWT)
+POST   /vector/reindex             - Re-embed all problems/resources, upsert + clean stale (JWT)
+GET    /vector/search?q=...        - Semantic search (JWT)
+```
+
+`GET /vector/search` params: `q` (required), optional `limit`, optional `type=problem|resource`. Returns ranked hits with `{ type, id, title, url, topic, difficulty, score }`.
 
 ---
 
@@ -503,6 +556,7 @@ graph TB
     end
     
     Ollama["Ollama<br/>(llama3.1:8b)<br/>local / dedicated host"]
+    VDB["Qdrant Cloud<br/>(vector DB)"]
     Users["Users"]
     
     Users -->|HTTPS| Client
@@ -514,6 +568,10 @@ graph TB
     Server1 -->|Query| DB
     Server2 -->|Query| DB
     Server3 -->|Query| DB
+
+    Server1 -->|Embed + search| VDB
+    Server2 -->|Embed + search| VDB
+    Server3 -->|Embed + search| VDB
     
     Server1 -->|Cache Hit| Cache
     Server2 -->|Cache Hit| Cache
@@ -561,6 +619,8 @@ graph TB
 | **Frontend** | React, TypeScript, Redux | Latest |
 | **Backend** | NestJS, TypeORM | Latest |
 | **Database** | PostgreSQL | 12+ |
+| **Vector Database** | Qdrant (Cloud), @qdrant/js-client-rest | Latest |
+| **Embeddings** | Ollama `nomic-embed-text` (768-dim, cosine) | Latest |
 | **Authentication** | JWT, Bcrypt | Standard |
 | **API Documentation** | Swagger/OpenAPI | Built-in |
 | **Validation** | NestJS ValidationPipe | Built-in |
@@ -575,6 +635,7 @@ The **DSA Learning Tool** is a modern, scalable learning platform built with:
 - **Role & rights-based access control** for flexible permissions
 - **Progress tracking with streak calculation** for user engagement
 - **Local LLM chatbot** with role-aware tool calling for natural-language access to topics, problems, and progress
+- **Semantic search via Qdrant** so users and the chatbot find problems/resources by meaning, not just keywords (SQL fallback included)
 - **RESTful API** with comprehensive Swagger documentation
 - **React frontend** with Redux state management
 - **PostgreSQL database** with proper indexing for 10k-50k users
@@ -602,3 +663,5 @@ The following features are valuable enhancements that can be added to improve sc
 13. **Persist Chat History** — Store conversations server-side (e.g. a `chat_message` table) so users can resume chats across sessions
 14. **Chat Tool-Call Logging** — Record tool calls + results for auditing and to debug/fix model behavior (basic logging exists via `[chat] tool call`)
 15. **LLM Model Upgrades** — Swap `llama3.1:8b` for a stronger model (e.g. GPT-4o-class via an API) or larger local model for better multi-step tool-calling reliability
+16. **Vector Relevance Threshold** — Filter Qdrant hits below a similarity score (e.g. 0.5) so the chatbot only cites confidently matching problems/resources
+17. **Hybrid Search Ranking** — Fuse vector similarity with SQL keyword hits (e.g. weighted score or Reciprocal Rank Fusion) for higher precision on exact-name queries
